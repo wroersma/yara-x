@@ -63,7 +63,7 @@ fn md5_data(
 
     hasher.update(data);
 
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hex::encode(hasher.finalize());
 
     MD5_CACHE.with(|cache| {
         cache.borrow_mut().insert((offset, size), digest.clone());
@@ -80,8 +80,7 @@ fn md5_str(
     let mut hasher = Md5::new();
     hasher.update(s.as_bstr(ctx));
 
-    Some(Lowercase::<FixedLenString<32>>::new(format!(
-        "{:x}",
+    Some(Lowercase::<FixedLenString<32>>::new(hex::encode(
         hasher.finalize()
     )))
 }
@@ -109,7 +108,7 @@ fn sha1_data(
 
     hasher.update(data);
 
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hex::encode(hasher.finalize());
 
     SHA1_CACHE.with(|cache| {
         cache.borrow_mut().insert((offset, size), digest.clone());
@@ -126,8 +125,7 @@ fn sha1_str(
     let mut hasher = Sha1::new();
     hasher.update(s.as_bstr(ctx));
 
-    Some(Lowercase::<FixedLenString<40>>::new(format!(
-        "{:x}",
+    Some(Lowercase::<FixedLenString<40>>::new(hex::encode(
         hasher.finalize()
     )))
 }
@@ -155,7 +153,7 @@ fn sha256_data(
 
     hasher.update(data);
 
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hex::encode(hasher.finalize());
 
     SHA256_CACHE.with(|cache| {
         cache.borrow_mut().insert((offset, size), digest.clone());
@@ -172,8 +170,7 @@ fn sha256_str(
     let mut hasher = Sha256::new();
     hasher.update(s.as_bstr(ctx));
 
-    Some(Lowercase::<FixedLenString<64>>::new(format!(
-        "{:x}",
+    Some(Lowercase::<FixedLenString<64>>::new(hex::encode(
         hasher.finalize()
     )))
 }

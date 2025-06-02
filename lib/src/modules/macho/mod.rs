@@ -376,7 +376,7 @@ fn dylib_hash(ctx: &mut ScanContext) -> Option<RuntimeString> {
 
     md5_hash.update(dylibs_to_hash.as_bytes());
 
-    let digest = format!("{:x}", md5_hash.finalize());
+    let digest = hex::encode(md5_hash.finalize());
 
     DYLIB_MD5_CACHE.with(|cache| {
         *cache.borrow_mut() = Some(digest.clone());
@@ -425,7 +425,7 @@ fn entitlement_hash(ctx: &mut ScanContext) -> Option<RuntimeString> {
 
     md5_hash.update(entitlements_str.as_bytes());
 
-    let digest = format!("{:x}", md5_hash.finalize());
+    let digest = hex::encode(md5_hash.finalize());
 
     ENTITLEMENT_MD5_CACHE.with(|cache| {
         *cache.borrow_mut() = Some(digest.clone());
@@ -473,7 +473,7 @@ fn export_hash(ctx: &mut ScanContext) -> Option<RuntimeString> {
 
     md5_hash.update(exports_str.as_bytes());
 
-    let digest = format!("{:x}", md5_hash.finalize());
+    let digest = hex::encode(md5_hash.finalize());
 
     EXPORT_MD5_CACHE.with(|cache| {
         *cache.borrow_mut() = Some(digest.clone());
@@ -521,7 +521,7 @@ fn import_hash(ctx: &mut ScanContext) -> Option<RuntimeString> {
 
     md5_hash.update(imports_str.as_bytes());
 
-    let digest = format!("{:x}", md5_hash.finalize());
+    let digest = hex::encode(md5_hash.finalize());
 
     IMPORT_MD5_CACHE.with(|cache| {
         *cache.borrow_mut() = Some(digest.clone());
@@ -558,7 +558,7 @@ fn sym_hash(ctx: &mut ScanContext) -> Option<RuntimeString> {
         return None;
     }
 
-    let mut md5_hash: digest::core_api::CoreWrapper<md5::Md5Core> = Md5::new();
+    let mut md5_hash = Md5::new();
 
     let symtab_hash_entries = symtab_to_hash
         .iter()
@@ -569,7 +569,7 @@ fn sym_hash(ctx: &mut ScanContext) -> Option<RuntimeString> {
 
     md5_hash.update(symtab_hash_entries);
 
-    let digest = format!("{:x}", md5_hash.finalize());
+    let digest = hex::encode(md5_hash.finalize());
 
     SYM_MD5_CACHE.with(|cache| {
         *cache.borrow_mut() = Some(digest.clone());

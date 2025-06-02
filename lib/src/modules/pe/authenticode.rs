@@ -8,6 +8,7 @@ use const_oid::db::{rfc5911, rfc5912, rfc6268};
 use const_oid::{AssociatedOid, ObjectIdentifier};
 use der_parser::asn1_rs::{Set, Tag, ToDer, UtcTime};
 use digest::{Digest, Output};
+use rsa::pkcs8::AssociatedOid as RsaAssociatedOid;
 use dsa::Components;
 use ecdsa::signature::hazmat::PrehashVerifier;
 use itertools::Itertools;
@@ -33,6 +34,34 @@ use crate::modules::utils::asn1::{
     ContentInfo, DigestInfo, SignedData, SignerInfo, SpcIndirectDataContent,
     SpcSpOpusInfo, TstInfo,
 };
+
+// Wrapper to adapt digest 0.11 hashers to std::io::Write
+struct DigestWriter<D: Digest> {
+    hasher: D,
+}
+
+impl<D: Digest> DigestWriter<D> {
+    fn new(hasher: D) -> Self {
+        Self { hasher }
+    }
+    
+    fn finalize(self) -> Output<D> {
+        self.hasher.finalize()
+    }
+}
+
+impl<D: Digest> std::io::Write for DigestWriter<D> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+    
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// MD2 should now work directly with digest 0.11 from the GitHub version
 
 /// Error returned by [`AuthenticodeParser::parse`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -881,36 +910,36 @@ fn verify_signer_info(si: &SignerInfo, certs: &[Certificate<'_>]) -> bool {
     // Verify that the signature in `SignerInfo` is correct.
     match digest_algorithm {
         rfc5912::ID_MD_2 | rfc5912::MD_2_WITH_RSA_ENCRYPTION => {
-            let mut md2 = Md2::default();
-            attrs_set.write_der(&mut md2).unwrap();
-            key.verify_digest::<Md2>(md2.finalize(), si.signature)
+            let mut md2_writer = DigestWriter::new(Md2::default());
+            attrs_set.write_der(&mut md2_writer).unwrap();
+            key.verify_digest::<Md2>(md2_writer.finalize(), si.signature)
         }
         rfc5912::ID_MD_5 | rfc5912::MD_5_WITH_RSA_ENCRYPTION => {
-            let mut md5 = Md5::default();
-            attrs_set.write_der(&mut md5).unwrap();
-            key.verify_digest::<Md5>(md5.finalize(), si.signature)
+            let mut md5_writer = DigestWriter::new(Md5::default());
+            attrs_set.write_der(&mut md5_writer).unwrap();
+            key.verify_digest::<Md5>(md5_writer.finalize(), si.signature)
         }
         rfc5912::ID_SHA_1
         | rfc5912::SHA_1_WITH_RSA_ENCRYPTION
         | oid::SHA1_WITH_RSA_ENCRYPTION_OBSOLETE => {
-            let mut sha1 = Sha1::default();
-            attrs_set.write_der(&mut sha1).unwrap();
-            key.verify_digest::<Sha1>(sha1.finalize(), si.signature)
+            let mut sha1_writer = DigestWriter::new(Sha1::default());
+            attrs_set.write_der(&mut sha1_writer).unwrap();
+            key.verify_digest::<Sha1>(sha1_writer.finalize(), si.signature)
         }
         rfc5912::ID_SHA_256 | rfc5912::SHA_256_WITH_RSA_ENCRYPTION => {
-            let mut sha256 = Sha256::default();
-            attrs_set.write_der(&mut sha256).unwrap();
-            key.verify_digest::<Sha256>(sha256.finalize(), si.signature)
+            let mut sha256_writer = DigestWriter::new(Sha256::default());
+            attrs_set.write_der(&mut sha256_writer).unwrap();
+            key.verify_digest::<Sha256>(sha256_writer.finalize(), si.signature)
         }
         rfc5912::ID_SHA_384 | rfc5912::SHA_384_WITH_RSA_ENCRYPTION => {
-            let mut sha384 = Sha384::default();
-            attrs_set.write_der(&mut sha384).unwrap();
-            key.verify_digest::<Sha384>(sha384.finalize(), si.signature)
+            let mut sha384_writer = DigestWriter::new(Sha384::default());
+            attrs_set.write_der(&mut sha384_writer).unwrap();
+            key.verify_digest::<Sha384>(sha384_writer.finalize(), si.signature)
         }
         rfc5912::ID_SHA_512 | rfc5912::SHA_512_WITH_RSA_ENCRYPTION => {
-            let mut sha512 = Sha512::default();
-            attrs_set.write_der(&mut sha512).unwrap();
-            key.verify_digest::<Sha512>(sha512.finalize(), si.signature)
+            let mut sha512_writer = DigestWriter::new(Sha512::default());
+            attrs_set.write_der(&mut sha512_writer).unwrap();
+            key.verify_digest::<Sha512>(sha512_writer.finalize(), si.signature)
         }
         _ => {
             #[cfg(feature = "logging")]
@@ -1217,7 +1246,7 @@ impl PublicKey {
     }
 
     #[cfg(not(feature = "x509-parser-verify"))]
-    fn verify_impl<D: Digest + AssociatedOid>(
+    fn verify_impl<D: Digest + AssociatedOid + RsaAssociatedOid>(
         &self,
         message: &[u8],
         signature: &[u8],
@@ -1226,7 +1255,7 @@ impl PublicKey {
         self.verify_digest::<D>(digest, signature)
     }
 
-    fn verify_digest<D: Digest + AssociatedOid>(
+    fn verify_digest<D: Digest + AssociatedOid + RsaAssociatedOid>(
         &self,
         hash: Output<D>,
         signature: &[u8],
