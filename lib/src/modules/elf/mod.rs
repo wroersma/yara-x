@@ -4,8 +4,10 @@ This allows creating YARA rules based on ELF metadata, including segments
 and sections information, exported symbols, target platform, etc.
  */
 
+use std::cell::RefCell;
+use std::sync::LazyLock;
+
 use itertools::Itertools;
-use lazy_static::lazy_static;
 use md5::{Digest, Md5};
 use rustc_hash::FxHashSet;
 use tlsh_fixed as tlsh;
@@ -18,13 +20,32 @@ pub mod parser;
 #[cfg(test)]
 mod tests;
 
+thread_local!(
+    static IMPORT_MD5_CACHE: RefCell<Option<String>> =
+        const { RefCell::new(None) };
+    static TLSH_CACHE: RefCell<Option<String>> = const { RefCell::new(None) };
+);
+
 #[module_main]
 fn main(data: &[u8], _meta: Option<&[u8]>) -> ELF {
+    IMPORT_MD5_CACHE.with(|cache| *cache.borrow_mut() = None);
+    TLSH_CACHE.with(|cache| *cache.borrow_mut() = None);
     parser::ElfParser::new().parse(data).unwrap_or_else(|_| ELF::new())
 }
 
 #[module_export]
 fn import_md5(ctx: &mut ScanContext) -> Option<RuntimeString> {
+    let cached = IMPORT_MD5_CACHE.with(|cache| -> Option<RuntimeString> {
+        cache
+            .borrow()
+            .as_deref()
+            .map(|s| RuntimeString::from_slice(ctx, s.as_bytes()))
+    });
+
+    if cached.is_some() {
+        return cached;
+    }
+
     let elf = ctx.module_output::<ELF>()?;
 
     let symbols = if elf.dynsym.is_empty() {
@@ -46,16 +67,20 @@ fn import_md5(ctx: &mut ScanContext) -> Option<RuntimeString> {
     let mut hasher = Md5::new();
     hasher.update(comma_separated_names.as_bytes());
 
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hex::encode(hasher.finalize());
+
+    IMPORT_MD5_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(digest.clone());
+    });
 
     Some(RuntimeString::new(digest))
 }
 
-lazy_static! {
-    /// Function names excluded while computing the telfhash. These exclusions
-    /// are based on the original implementation:
-    /// https://github.com/trendmicro/telfhash/blob/master/telfhash/telfhash.py
-    pub(crate) static ref TELFHASH_EXCLUSIONS: FxHashSet<&'static str> = {
+/// Function names excluded while computing the telfhash. These exclusions
+/// are based on the original implementation:
+/// https://github.com/trendmicro/telfhash/blob/master/telfhash/telfhash.py
+pub(crate) static TELFHASH_EXCLUSIONS: LazyLock<FxHashSet<&'static str>> =
+    LazyLock::new(|| {
         let mut exclusions = FxHashSet::default();
         exclusions.insert("__libc_start_main");
         exclusions.insert("main");
@@ -66,8 +91,7 @@ lazy_static! {
         exclusions.insert("atol");
         exclusions.insert("malloc_trim");
         exclusions
-    };
-}
+    });
 
 /// Function that returns the [`telfhash`][1] for the current ELF file.
 ///
@@ -78,6 +102,17 @@ lazy_static! {
 /// [1]: https://github.com/trendmicro/telfhash
 #[module_export]
 fn telfhash(ctx: &mut ScanContext) -> Option<RuntimeString> {
+    let cached = TLSH_CACHE.with(|cache| -> Option<RuntimeString> {
+        cache
+            .borrow()
+            .as_deref()
+            .map(|s| RuntimeString::from_slice(ctx, s.as_bytes()))
+    });
+
+    if cached.is_some() {
+        return cached;
+    }
+
     let elf = ctx.module_output::<ELF>()?;
 
     // Prefer dynsym over symbtab.
@@ -127,7 +162,11 @@ fn telfhash(ctx: &mut ScanContext) -> Option<RuntimeString> {
 
     builder.update(comma_separated_names.as_bytes());
 
-    let tlsh = builder.build().ok()?;
+    let digest = builder.build().ok()?.hash();
 
-    Some(RuntimeString::new(tlsh.hash()))
+    IMPORT_MD5_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(digest.clone());
+    });
+
+    Some(RuntimeString::new(digest))
 }

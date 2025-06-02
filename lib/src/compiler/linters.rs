@@ -1,7 +1,6 @@
 use regex::{Error, Regex};
 
-use yara_x_parser::ast;
-use yara_x_parser::ast::{Meta, WithSpan};
+use yara_x_parser::ast::{self, Meta, WithSpan};
 
 use crate::compiler::report::ReportBuilder;
 use crate::compiler::Warning;
@@ -97,13 +96,13 @@ impl LinterInternal for RuleName {
             if self.error {
                 LinterResult::Err(errors::InvalidRuleName::build(
                     report_builder,
-                    rule.identifier.span().into(),
+                    report_builder.span_to_code_loc(rule.identifier.span()),
                     self.regex.clone(),
                 ))
             } else {
                 LinterResult::Warn(warnings::InvalidRuleName::build(
                     report_builder,
-                    rule.identifier.span().into(),
+                    report_builder.span_to_code_loc(rule.identifier.span()),
                     self.regex.clone(),
                 ))
             }
@@ -202,7 +201,7 @@ impl LinterInternal for Tags {
                     if self.error {
                         return LinterResult::Err(errors::UnknownTag::build(
                             report_builder,
-                            tag.span().into(),
+                            report_builder.span_to_code_loc(tag.span()),
                             tag.name.to_string(),
                             Some(format!(
                                 "allowed tags: {}",
@@ -212,7 +211,7 @@ impl LinterInternal for Tags {
                     } else {
                         results.push(warnings::UnknownTag::build(
                             report_builder,
-                            tag.span().into(),
+                            report_builder.span_to_code_loc(tag.span()),
                             tag.name.to_string(),
                             Some(format!(
                                 "allowed tags: {}",
@@ -230,14 +229,14 @@ impl LinterInternal for Tags {
                     if self.error {
                         return LinterResult::Err(errors::InvalidTag::build(
                             report_builder,
-                            tag.span().into(),
+                            report_builder.span_to_code_loc(tag.span()),
                             tag.name.to_string(),
                             self.regex.as_ref().unwrap().clone(),
                         ));
                     } else {
                         results.push(warnings::InvalidTag::build(
                             report_builder,
-                            tag.span().into(),
+                            report_builder.span_to_code_loc(tag.span()),
                             tag.name.to_string(),
                             self.regex.as_ref().unwrap().clone(),
                         ));
@@ -381,7 +380,8 @@ impl LinterInternal for Metadata<'_> {
                             LinterResult::Err(errors::InvalidMetadata::build(
                                 report_builder,
                                 meta.identifier.name.to_string(),
-                                meta.value.span().into(),
+                                report_builder
+                                    .span_to_code_loc(meta.value.span()),
                                 self.message
                                     .clone()
                                     .unwrap_or("invalid metadata".to_string()),
@@ -391,7 +391,8 @@ impl LinterInternal for Metadata<'_> {
                                 warnings::InvalidMetadata::build(
                                     report_builder,
                                     meta.identifier.name.to_string(),
-                                    meta.value.span().into(),
+                                    report_builder
+                                        .span_to_code_loc(meta.value.span()),
                                     self.message.clone().unwrap_or(
                                         "invalid metadata".to_string(),
                                     ),
@@ -408,14 +409,14 @@ impl LinterInternal for Metadata<'_> {
             return if self.error {
                 LinterResult::Err(errors::MissingMetadata::build(
                     report_builder,
-                    rule.identifier.span().into(),
+                    report_builder.span_to_code_loc(rule.identifier.span()),
                     self.identifier.clone(),
                     self.note.clone(),
                 ))
             } else {
                 LinterResult::Warn(warnings::MissingMetadata::build(
                     report_builder,
-                    rule.identifier.span().into(),
+                    report_builder.span_to_code_loc(rule.identifier.span()),
                     self.identifier.clone(),
                     self.note.clone(),
                 ))

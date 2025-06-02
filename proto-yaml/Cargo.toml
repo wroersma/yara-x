@@ -14,9 +14,9 @@ rust-version.workspace = true
 [dependencies]
 chrono = { workspace = true }
 protobuf = { workspace = true }
-protobuf-support = { workspace = true }
 itertools = { workspace = true }
 yansi = { workspace = true }
+yara-x-proto = { workspace = true }
 
 [dev-dependencies]
 goldenfile = { workspace = true }
@@ -25,4 +25,3 @@ globwalk = { workspace = true }
 [build-dependencies]
 protobuf = { workspace = true }
 protobuf-codegen = { workspace = true }
-protobuf-parse = { workspace = true }

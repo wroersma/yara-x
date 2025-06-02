@@ -5,13 +5,13 @@ use crate::types::TypeValue;
 
 #[test]
 fn expr_size() {
-    // Sentinel test for making sure tha Expr doesn't grow in future
+    // Sentinel test for making sure the Expr doesn't grow in future
     // changes.
     #[cfg(target_pointer_width = "32")]
-    assert_eq!(size_of::<Expr>(), 20);
+    assert_eq!(size_of::<Expr>(), 24);
 
     #[cfg(target_pointer_width = "64")]
-    assert_eq!(size_of::<Expr>(), 32);
+    assert_eq!(size_of::<Expr>(), 40);
 }
 
 #[test]
@@ -35,22 +35,6 @@ fn ancestors() {
 
     let mut ancestors = ir.ancestors(root);
     assert_eq!(ancestors.next(), None);
-}
-
-#[test]
-fn common_ancestor() {
-    let mut ir = IR::new();
-
-    let const_1 = ir.constant(TypeValue::const_integer_from(1));
-    let const_2 = ir.constant(TypeValue::const_integer_from(2));
-    let const_3 = ir.constant(TypeValue::const_integer_from(3));
-    let add = ir.add(vec![const_2, const_3]).unwrap();
-    let root = ir.add(vec![const_1, add]).unwrap();
-
-    assert_eq!(ir.common_ancestor(&[const_1, const_3]), root);
-    assert_eq!(ir.common_ancestor(&[const_2, const_3]), add);
-    assert_eq!(ir.common_ancestor(&[const_1, const_1]), const_1);
-    assert_eq!(ir.common_ancestor(&[const_1, add, const_2]), root);
 }
 
 #[test]
@@ -114,7 +98,6 @@ fn ir() {
         let w = BufWriter::new(output_file);
 
         compiler
-            .cse(false)
             .hoisting(false)
             .set_ir_writer(w)
             .add_source(source.as_str())
@@ -128,7 +111,6 @@ fn ir() {
             let w = BufWriter::new(output_file);
 
             compiler
-                .cse(true)
                 .hoisting(false)
                 .set_ir_writer(w)
                 .add_source(source.as_str())
@@ -140,7 +122,6 @@ fn ir() {
             let w = BufWriter::new(output_file);
 
             compiler
-                .cse(false)
                 .hoisting(true)
                 .set_ir_writer(w)
                 .add_source(source.as_str())

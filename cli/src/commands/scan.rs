@@ -97,6 +97,13 @@ pub fn scan() -> Command {
                 .action(ArgAction::Append)
         )
         .arg(
+            arg!(-I --"include-dir" <PATH>)
+                .help("Directory in which to search for included files")
+                .long_help(help::INCLUDE_DIR_LONG_HELP)
+                .value_parser(value_parser!(PathBuf))
+                .action(ArgAction::Append)
+        )
+        .arg(
             arg!(-x --"module-data")
                 .help("Pass FILE's content as extra data to MODULE")
                 .long_help(help::MODULE_DATA_LONG_HELP)
@@ -676,7 +683,7 @@ mod output_handler {
     ) -> Vec<RuleJson> {
         scan_results
             .filter(move |rule| {
-                output_options.only_tag.as_ref().map_or(true, |only_tag| {
+                output_options.only_tag.as_ref().is_none_or(|only_tag| {
                     rule.tags().any(|tag| tag.identifier() == only_tag)
                 })
             })
@@ -1105,8 +1112,7 @@ mod output_handler {
             // prepare the increment *outside* the critical section
             let matches = scan_results
                 .filter(|rule| {
-                    self.output_options.only_tag.as_ref().map_or(
-                        true,
+                    self.output_options.only_tag.as_ref().is_none_or(
                         |only_tag| {
                             rule.tags().any(|tag| tag.identifier() == only_tag)
                         },

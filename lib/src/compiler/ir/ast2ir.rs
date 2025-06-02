@@ -33,11 +33,16 @@ use crate::errors::CustomError;
 use crate::errors::{MethodNotAllowedInWith, PotentiallySlowLoop};
 use crate::re;
 use crate::symbols::{Symbol, SymbolLookup, SymbolTable};
-use crate::types::{Map, Regexp, Type, TypeValue, Value};
+use crate::types::Value::Const;
+use crate::types::{Map, Regexp, StringConstraint, Type, TypeValue};
+use crate::warnings::UnsatisfiableExpression;
 
 /// How many patterns a rule can have. If a rule has more than this number of
 /// patterns the [`TooManyPatterns`] error is returned.
 const MAX_PATTERNS_PER_RULE: usize = 100_000;
+
+/// Maximum number of iterations a loop can have before triggering a warning.
+const MAX_LOOP_ITERATIONS: i64 = 1_000_000;
 
 pub(in crate::compiler) fn patterns_from_ast<'src>(
     ctx: &mut CompileContext<'_, 'src, '_>,
@@ -54,8 +59,10 @@ pub(in crate::compiler) fn patterns_from_ast<'src>(
                 return Err(DuplicatePattern::build(
                     ctx.report_builder,
                     pattern.identifier().name.to_string(),
-                    pattern.identifier().span().into(),
-                    existing.identifier.span().into(),
+                    ctx.report_builder
+                        .span_to_code_loc(pattern.identifier().span()),
+                    ctx.report_builder
+                        .span_to_code_loc(existing.identifier.span()),
                 ));
             }
         }
@@ -63,7 +70,7 @@ pub(in crate::compiler) fn patterns_from_ast<'src>(
             return Err(TooManyPatterns::build(
                 ctx.report_builder,
                 MAX_PATTERNS_PER_RULE,
-                rule.identifier.span().into(),
+                ctx.report_builder.span_to_code_loc(rule.identifier.span()),
             ));
         }
         ctx.current_rule_patterns.push(pattern);
@@ -81,7 +88,7 @@ fn pattern_from_ast<'src>(
         if !modifiers.insert(modifier.as_text()) {
             return Err(DuplicateModifier::build(
                 ctx.report_builder,
-                modifier.span().into(),
+                ctx.report_builder.span_to_code_loc(modifier.span()),
             ));
         }
     }
@@ -120,8 +127,8 @@ pub(in crate::compiler) fn text_pattern_from_ast<'src>(
                 ctx.report_builder,
                 name1.to_string(),
                 name2.to_string(),
-                modifier1.span().into(),
-                modifier2.span().into(),
+                ctx.report_builder.span_to_code_loc(modifier1.span()),
+                ctx.report_builder.span_to_code_loc(modifier2.span()),
                 Some("these two modifiers can't be used together".to_string()),
             ));
         };
@@ -154,7 +161,7 @@ pub(in crate::compiler) fn text_pattern_from_ast<'src>(
                         "lower bound ({}) is greater than upper bound ({})",
                         start, end
                     ),
-                    modifier.span().into(),
+                    ctx.report_builder.span_to_code_loc(modifier.span()),
                 ));
             }
             flags.insert(PatternFlags::Xor);
@@ -174,7 +181,7 @@ pub(in crate::compiler) fn text_pattern_from_ast<'src>(
             Err(err) => Err(InvalidBase64Alphabet::build(
                 ctx.report_builder,
                 err.to_string().to_lowercase(),
-                alphabet.span().into(),
+                ctx.report_builder.span_to_code_loc(alphabet.span()),
             )),
         }
     };
@@ -222,7 +229,7 @@ pub(in crate::compiler) fn text_pattern_from_ast<'src>(
             ctx.report_builder,
             pattern.identifier.name.to_string(),
             "this pattern is too short".to_string(),
-            pattern.text.span().into(),
+            ctx.report_builder.span_to_code_loc(pattern.text.span()),
             note,
         ));
     }
@@ -255,7 +262,7 @@ pub(in crate::compiler) fn hex_pattern_from_ast<'src>(
                     ctx.report_builder,
                     "this modifier can't be applied to a hex pattern"
                         .to_string(),
-                    modifier.span().into(),
+                    ctx.report_builder.span_to_code_loc(modifier.span()),
                 ));
             }
         }
@@ -264,18 +271,20 @@ pub(in crate::compiler) fn hex_pattern_from_ast<'src>(
     let hir = re::hir::Hir::from(hex_pattern_hir_from_ast(ctx, pattern)?);
 
     // Check if the hex pattern can be written as an ASCII string. For instance,
-    // {61 61 61} can be written as "aaa", which is more legible. Notice that
-    // { 00 00 00 } is also a valid ASCII string, so we make sure that the string
-    // doesn't contain zeroes.
+    // {61 61 61} can be written as "aaa", which is more legible. The string
+    // must contain only printable ASCII characters, tabs, newlines or line
+    // breaks.
     if let Some(literal) =
         hir.as_literal_bytes().and_then(|lit| lit.to_str().ok())
     {
-        if literal.is_ascii() && !literal.contains('\0') {
+        if literal.chars().all(|c| {
+            c.is_ascii() && (c >= ' ' || c == '\t' || c == '\n' || c == '\r')
+        }) {
             ctx.warnings.add(|| {
                 TextPatternAsHex::build(
                     ctx.report_builder,
                     literal.escape_default().to_string(),
-                    pattern.span().into(),
+                    ctx.report_builder.span_to_code_loc(pattern.span()),
                 )
             });
         }
@@ -307,7 +316,7 @@ pub(in crate::compiler) fn regexp_pattern_from_ast<'src>(
                 return Err(InvalidModifier::build(
                     ctx.report_builder,
                     "this modifier can't be applied to a regexp".to_string(),
-                    modifier.span().into(),
+                    ctx.report_builder.span_to_code_loc(modifier.span()),
                 ));
             }
             _ => {}
@@ -346,8 +355,12 @@ pub(in crate::compiler) fn regexp_pattern_from_ast<'src>(
         ctx.warnings.add(|| {
             warnings::RedundantCaseModifier::build(
                 ctx.report_builder,
-                pattern.modifiers.nocase().unwrap().span().into(),
-                pattern.regexp.span().subspan(i_pos, i_pos + 1).into(),
+                ctx.report_builder.span_to_code_loc(
+                    pattern.modifiers.nocase().unwrap().span(),
+                ),
+                ctx.report_builder.span_to_code_loc(
+                    pattern.regexp.span().subspan(i_pos, i_pos + 1),
+                ),
             )
         });
     }
@@ -411,7 +424,7 @@ fn expr_from_ast(
         ast::Expr::Entrypoint { span } => {
             return Err(EntrypointUnsupported::build(
                 ctx.report_builder,
-                span.into(),
+                ctx.report_builder.span_to_code_loc(span.clone()),
             ));
         }
         ast::Expr::Filesize { .. } => ctx.ir.filesize(),
@@ -493,38 +506,46 @@ fn expr_from_ast(
             let replacement =
                 match (lhs_expr.type_value(), rhs_expr.type_value()) {
                     (
-                        TypeValue::Bool(_),
-                        TypeValue::Integer(Value::Const(0)),
+                        TypeValue::Bool { .. },
+                        TypeValue::Integer { value: Const(0) },
                     ) => Some((
                         ctx.ir.not(lhs),
                         format!(
                             "not {}",
-                            ctx.report_builder.get_snippet(&lhs_span.into())
+                            ctx.report_builder.get_snippet(
+                                &ctx.report_builder.span_to_code_loc(lhs_span)
+                            )
                         ),
                     )),
                     (
-                        TypeValue::Integer(Value::Const(0)),
-                        TypeValue::Bool(_),
+                        TypeValue::Integer { value: Const(0) },
+                        TypeValue::Bool { .. },
                     ) => Some((
                         ctx.ir.not(rhs),
                         format!(
                             "not {}",
-                            ctx.report_builder.get_snippet(&rhs_span.into())
+                            ctx.report_builder.get_snippet(
+                                &ctx.report_builder.span_to_code_loc(rhs_span)
+                            )
                         ),
                     )),
                     (
-                        TypeValue::Bool(_),
-                        TypeValue::Integer(Value::Const(1)),
+                        TypeValue::Bool { .. },
+                        TypeValue::Integer { value: Const(1) },
                     ) => Some((
                         lhs,
-                        ctx.report_builder.get_snippet(&lhs_span.into()),
+                        ctx.report_builder.get_snippet(
+                            &ctx.report_builder.span_to_code_loc(lhs_span),
+                        ),
                     )),
                     (
-                        TypeValue::Integer(Value::Const(1)),
-                        TypeValue::Bool(_),
+                        TypeValue::Integer { value: Const(1) },
+                        TypeValue::Bool { .. },
                     ) => Some((
                         rhs,
-                        ctx.report_builder.get_snippet(&rhs_span.into()),
+                        ctx.report_builder.get_snippet(
+                            &ctx.report_builder.span_to_code_loc(rhs_span),
+                        ),
                     )),
                     _ => None,
                 };
@@ -534,7 +555,7 @@ fn expr_from_ast(
                     warnings::BooleanIntegerComparison::build(
                         ctx.report_builder,
                         msg,
-                        span.into(),
+                        ctx.report_builder.span_to_code_loc(span),
                     )
                 });
                 expr
@@ -610,7 +631,7 @@ fn expr_from_ast(
                             ctx.report_builder,
                             entry.error_title.clone(),
                             entry.error_label.clone(),
-                            ident.span().into(),
+                            ctx.report_builder.span_to_code_loc(ident.span()),
                         ));
                     }
                 }
@@ -630,7 +651,7 @@ fn expr_from_ast(
                         return Err(SyntaxError::build(
                             ctx.report_builder,
                             "this `$` is outside of the body of a `for .. of` statement".to_string(),
-                            p.identifier.span().into(),
+                            ctx.report_builder.span_to_code_loc(p.identifier.span()),
                         ));
                     }
                     // If we are inside a loop, we don't know which is the
@@ -679,7 +700,7 @@ fn expr_from_ast(
                 return Err(SyntaxError::build(
                     ctx.report_builder,
                     "this `#` is outside of the body of a `for .. of` statement".to_string(),
-                    p.identifier.span().into(),
+                    ctx.report_builder.span_to_code_loc(p.identifier.span()),
                 ));
             }
             match (p.identifier.name, &p.range) {
@@ -719,7 +740,7 @@ fn expr_from_ast(
                 return Err(SyntaxError::build(
                     ctx.report_builder,
                     "this `@` is outside of the body of a `for .. of` statement".to_string(),
-                    p.identifier.span().into(),
+                    ctx.report_builder.span_to_code_loc(p.identifier.span()),
                 ));
             }
             match (p.identifier.name, &p.index) {
@@ -761,7 +782,7 @@ fn expr_from_ast(
                 return Err(SyntaxError::build(
                     ctx.report_builder,
                     "this `!` is outside of the body of a `for .. of` statement".to_string(),
-                    p.identifier.span().into(),
+                    ctx.report_builder.span_to_code_loc(p.identifier.span()),
                 ));
             }
             match (p.identifier.name, &p.index) {
@@ -828,7 +849,8 @@ fn expr_from_ast(
                         ctx.report_builder,
                         format!("`{}` or `{}`", Type::Array, Type::Map),
                         format!("`{}`", type_value.ty()),
-                        expr.primary.span().into(),
+                        ctx.report_builder
+                            .span_to_code_loc(expr.primary.span()),
                         None,
                     ))
                 }
@@ -860,7 +882,7 @@ pub(in crate::compiler) fn rule_condition_from_ast(
             warnings::InvariantBooleanExpression::build(
                 ctx.report_builder,
                 value,
-                rule.condition.span().into(),
+                ctx.report_builder.span_to_code_loc(rule.condition.span()),
                 Some(format!(
                     "rule `{}` is always `{}`",
                     rule.identifier.name, value
@@ -880,7 +902,7 @@ fn bool_expr_from_ast(
 ) -> Result<ExprId, CompileError> {
     ctx.one_shot_symbol_table = None;
 
-    let code_loc = ast.span().into();
+    let code_loc = ctx.report_builder.span_to_code_loc(ast.span());
     let expr = expr_from_ast(ctx, ast)?;
 
     match ctx.ir.get(expr).type_value() {
@@ -910,6 +932,15 @@ fn bool_expr_from_ast(
                 ctx.report_builder,
                 "`bool`".to_string(),
                 "a map".to_string(),
+                code_loc,
+                None,
+            ))
+        }
+        TypeValue::Struct(_) => {
+            return Err(WrongType::build(
+                ctx.report_builder,
+                "`bool`".to_string(),
+                "a struct".to_string(),
                 code_loc,
                 None,
             ))
@@ -999,11 +1030,11 @@ fn of_expr_from_ast(
     // the `of` expression is always false.
     if let Quantifier::Expr(expr) = &quantifier {
         if let Some(value) = ctx.ir.get(*expr).try_as_const_integer() {
-            if value > items.len().try_into().unwrap() {
+            if value > items.len() as i64 {
                 ctx.warnings.add(|| warnings::InvariantBooleanExpression::build(
                     ctx.report_builder,
                     false,
-                    of.span().into(),
+                    ctx.report_builder.span_to_code_loc(of.span()),
                     Some(format!(
                         "the expression requires {} matching patterns out of {}",
                         value, items.len()
@@ -1033,32 +1064,33 @@ fn of_expr_from_ast(
             // `all of <items> at <expr>`: the warning is raised only if there
             // are more than one item. `all of ($a) at 0` doesn't raise a
             // warning.
-            Quantifier::All { .. } => items.len() > 1,
+            Quantifier::All => items.len() > 1,
             // `<expr> of <items> at <expr>: the warning is raised if <expr> is
             // 2 or more.
             Quantifier::Expr(expr) => match ctx.ir.get(*expr).type_value() {
-                TypeValue::Integer(Value::Const(value)) => value >= 2,
+                TypeValue::Integer { value: Const(value) } => value >= 2,
                 _ => false,
             },
             // `<expr>% of <items> at <expr>: the warning is raised if the
             // <expr> percent of the items is 2 or more.
             Quantifier::Percentage(expr) => {
                 match ctx.ir.get(*expr).type_value() {
-                    TypeValue::Integer(Value::Const(percentage)) => {
+                    TypeValue::Integer { value: Const(percentage) } => {
                         items.len() as f64 * percentage as f64 / 100.0 >= 2.0
                     }
                     _ => false,
                 }
             }
-            Quantifier::None { .. } | Quantifier::Any { .. } => false,
+            Quantifier::None | Quantifier::Any => false,
         };
 
         if raise_warning {
             ctx.warnings.add(|| {
                 warnings::PotentiallyUnsatisfiableExpression::build(
                     ctx.report_builder,
-                    of.quantifier.span().into(),
-                    of.anchor.as_ref().unwrap().span().into(),
+                    ctx.report_builder.span_to_code_loc(of.quantifier.span()),
+                    ctx.report_builder
+                        .span_to_code_loc(of.anchor.as_ref().unwrap().span()),
                 )
             });
         }
@@ -1096,7 +1128,6 @@ fn for_of_expr_from_ast(
 ) -> Result<ExprId, CompileError> {
     let quantifier = quantifier_from_ast(ctx, &for_of.quantifier)?;
     let pattern_set = pattern_set_from_ast(ctx, &for_of.pattern_set)?;
-
     let mut stack_frame = ctx.vars.new_frame(VarStack::FOR_OF_FRAME_SIZE);
 
     let for_vars = ForVars {
@@ -1113,7 +1144,7 @@ fn for_of_expr_from_ast(
         "$",
         Symbol::Var {
             var: next_pattern_id,
-            type_value: TypeValue::Integer(Value::Unknown),
+            type_value: TypeValue::unknown_integer(),
         },
     );
 
@@ -1168,27 +1199,46 @@ fn for_in_expr_from_ast(
     let quantifier = quantifier_from_ast(ctx, &for_in.quantifier)?;
     let iterable = iterable_from_ast(ctx, &for_in.iterable)?;
 
+    let parent_multiplier = ctx.loop_iteration_multiplier;
+
+    if let Some(loop_iterations) = iterable.num_iterations(ctx.ir) {
+        let combined_iterations =
+            parent_multiplier.saturating_mul(loop_iterations);
+        if combined_iterations > MAX_LOOP_ITERATIONS {
+            ctx.warnings.add(|| {
+                warnings::TooManyIterations::build(
+                    ctx.report_builder,
+                    combined_iterations,
+                    ctx.report_builder.span_to_code_loc(for_in.span()),
+                )
+            });
+        }
+        ctx.loop_iteration_multiplier = combined_iterations;
+    }
+
     let (expected_vars, iterable_ty) = match &iterable {
         Iterable::Range(range) => {
             // Raise warning when the `for` loop iterates over a range that
-            // may be very large.
+            // may be very large, because it depends on the file size or the
+            // number of occurrences of some pattern (i.e: #a).
             if is_potentially_large_range(ctx, range) {
                 if ctx.error_on_slow_loop {
                     return Err(PotentiallySlowLoop::build(
                         ctx.report_builder,
-                        for_in.iterable.span().into(),
+                        ctx.report_builder
+                            .span_to_code_loc(for_in.iterable.span()),
                     ));
                 } else {
                     ctx.warnings.add(|| {
                         warnings::PotentiallySlowLoop::build(
                             ctx.report_builder,
-                            for_in.iterable.span().into(),
+                            ctx.report_builder
+                                .span_to_code_loc(for_in.iterable.span()),
                         )
                     })
                 }
             }
-
-            (vec![TypeValue::Integer(Value::Unknown)], Type::Unknown)
+            (vec![TypeValue::unknown_integer()], Type::Unknown)
         }
         Iterable::ExprTuple(expressions) => {
             // All expressions in the tuple have the same type, we can use
@@ -1211,11 +1261,11 @@ fn for_in_expr_from_ast(
             TypeValue::Array(array) => (vec![array.deputy()], Type::Array),
             TypeValue::Map(map) => match map.as_ref() {
                 Map::IntegerKeys { .. } => (
-                    vec![TypeValue::Integer(Value::Unknown), map.deputy()],
+                    vec![TypeValue::unknown_integer(), map.deputy()],
                     Type::Map,
                 ),
                 Map::StringKeys { .. } => (
-                    vec![TypeValue::String(Value::Unknown), map.deputy()],
+                    vec![TypeValue::unknown_string(), map.deputy()],
                     Type::Map,
                 ),
             },
@@ -1236,8 +1286,8 @@ fn for_in_expr_from_ast(
             ctx.report_builder,
             loop_vars.len() as u8,
             expected_vars.len() as u8,
-            for_in.iterable.span().into(),
-            span.into(),
+            ctx.report_builder.span_to_code_loc(for_in.iterable.span()),
+            ctx.report_builder.span_to_code_loc(span),
         ));
     }
 
@@ -1273,6 +1323,9 @@ fn for_in_expr_from_ast(
 
     ctx.vars.unwind(&stack_frame);
 
+    // Restore the parent multiplier after the loop body has been processed.
+    ctx.loop_iteration_multiplier = parent_multiplier;
+
     Ok(ctx.ir.for_in(
         quantifier,
         variables,
@@ -1307,7 +1360,8 @@ fn with_expr_from_ast(
             if func.method_of().is_some() {
                 return Err(MethodNotAllowedInWith::build(
                     ctx.report_builder,
-                    item.expression.span().into(),
+                    ctx.report_builder
+                        .span_to_code_loc(item.expression.span()),
                 ));
             }
             symbols.borrow_mut().insert(name, Symbol::Func(func.clone()));
@@ -1368,8 +1422,8 @@ fn iterable_from_ast(
                             ctx.report_builder,
                             prev_ty.to_string(),
                             ty.to_string(),
-                            prev_span.into(),
-                            span.into(),
+                            ctx.report_builder.span_to_code_loc(prev_span),
+                            ctx.report_builder.span_to_code_loc(span),
                         ));
                     }
                 }
@@ -1408,8 +1462,8 @@ fn range_from_ast(
     // variables, for example) we can't raise an error at compile time, but it
     // will be handled at scan time.
     if let (
-        TypeValue::Integer(Value::Const(lower_bound)),
-        TypeValue::Integer(Value::Const(upper_bound)),
+        TypeValue::Integer { value: Const(lower_bound) },
+        TypeValue::Integer { value: Const(upper_bound) },
     ) = (
         ctx.ir.get(lower_bound).type_value(),
         ctx.ir.get(upper_bound).type_value(),
@@ -1421,7 +1475,7 @@ fn range_from_ast(
                     "lower bound ({}) is greater than upper bound ({})",
                     lower_bound, upper_bound
                 ),
-                range.span().into(),
+                ctx.report_builder.span_to_code_loc(range.span()),
             ));
         }
     }
@@ -1439,11 +1493,11 @@ fn non_negative_integer_from_ast(
     check_type(ctx, expr, span.clone(), &[Type::Integer])?;
 
     let type_value = ctx.ir.get(expr).type_value();
-    if let TypeValue::Integer(Value::Const(value)) = type_value {
+    if let TypeValue::Integer { value: Const(value) } = type_value {
         if value < 0 {
             return Err(UnexpectedNegativeNumber::build(
                 ctx.report_builder,
-                span.into(),
+                ctx.report_builder.span_to_code_loc(span),
             ));
         }
     }
@@ -1465,13 +1519,13 @@ fn integer_in_range_from_ast(
     // the given range.
     let type_value = ctx.ir.get(expr).type_value();
 
-    if let TypeValue::Integer(Value::Const(value)) = type_value {
+    if let TypeValue::Integer { value: Const(value) } = type_value {
         if !range.contains(&value) {
             return Err(NumberOutOfRange::build(
                 ctx.report_builder,
                 *range.start(),
                 *range.end(),
-                span.into(),
+                ctx.report_builder.span_to_code_loc(span),
             ));
         }
     }
@@ -1516,7 +1570,7 @@ fn pattern_set_from_ast(
             if pattern_indexes.is_empty() {
                 return Err(EmptyPatternSet::build(
                     ctx.report_builder,
-                    span.into(),
+                    ctx.report_builder.span_to_code_loc(span.clone()),
                     Some("this rule doesn't define any patterns".to_string()),
                 ));
             }
@@ -1539,7 +1593,7 @@ fn pattern_set_from_ast(
                 {
                     return Err(EmptyPatternSet::build(
                         ctx.report_builder,
-                        item.span().into(),
+                        ctx.report_builder.span_to_code_loc(item.span()),
                         Some(if item.wildcard {
                             format!(
                                 "`{}*` doesn't match any pattern identifier",
@@ -1595,7 +1649,8 @@ fn func_call_from_ast(
                 ctx.report_builder,
                 "`function`".to_string(),
                 format!("`{}`", symbol.ty()),
-                func_call.span().into(),
+                ctx.report_builder
+                    .span_to_code_loc(func_call.identifier.span()),
                 None,
             ))
         }
@@ -1645,7 +1700,7 @@ fn func_call_from_ast(
     if matching_signature.is_none() {
         return Err(WrongArguments::build(
             ctx.report_builder,
-            func_call.args_span().into(),
+            ctx.report_builder.span_to_code_loc(func_call.args_span()),
             Some(format!(
                 "accepted argument combinations:\n\n{}",
                 expected_args
@@ -1700,7 +1755,7 @@ fn check_type(
             ctx.report_builder,
             CompileError::join_with_or(accepted_types, true),
             format!("`{}`", ty),
-            span.into(),
+            ctx.report_builder.span_to_code_loc(span),
             None,
         ))
     }
@@ -1741,8 +1796,8 @@ fn check_operands(
             ctx.report_builder,
             lhs_ty.to_string(),
             rhs_ty.to_string(),
-            lhs_span.into(),
-            rhs_span.into(),
+            ctx.report_builder.span_to_code_loc(lhs_span),
+            ctx.report_builder.span_to_code_loc(rhs_span),
         ));
     }
 
@@ -1768,11 +1823,12 @@ fn re_error_to_compile_error(
                 // /someregexp/
                 //  ^ this is position 0 for error spans
                 // ^ this is where the regexp starts according to the regexp span
-                regexp
-                    .span()
-                    .subspan(span.start.offset, span.end.offset)
-                    .offset(1)
-                    .into(),
+                report_builder.span_to_code_loc(
+                    regexp
+                        .span()
+                        .subspan(span.start.offset, span.end.offset)
+                        .offset(1),
+                ),
                 note,
             )
         }
@@ -1785,16 +1841,18 @@ fn re_error_to_compile_error(
             report_builder,
             if is_greedy_1 { "greedy" } else { "non-greedy" }.to_string(),
             if is_greedy_2 { "greedy" } else { "non-greedy" }.to_string(),
-            regexp
-                .span()
-                .subspan(span_1.start.offset, span_1.end.offset)
-                .offset(1)
-                .into(),
-            regexp
-                .span()
-                .subspan(span_2.start.offset, span_2.end.offset)
-                .offset(1)
-                .into(),
+            report_builder.span_to_code_loc(
+                regexp
+                    .span()
+                    .subspan(span_1.start.offset, span_1.end.offset)
+                    .offset(1),
+            ),
+            report_builder.span_to_code_loc(
+                regexp
+                    .span()
+                    .subspan(span_2.start.offset, span_2.end.offset)
+                    .offset(1),
+            ),
         ),
     }
 }
@@ -1825,7 +1883,7 @@ pub(in crate::compiler) fn warn_if_not_bool(
             warnings::NonBooleanAsBoolean::build(
                 ctx.report_builder,
                 ty.to_string(),
-                span.into(),
+                ctx.report_builder.span_to_code_loc(span),
                 note,
             )
         });
@@ -1973,8 +2031,8 @@ macro_rules! gen_n_ary_operation {
                             ctx.report_builder,
                             lhs_ty.to_string(),
                             rhs_ty.to_string(),
-                            expr.first().span().combine(&lhs_ast.span()).into(),
-                            rhs_ast.span().into(),
+                            ctx.report_builder.span_to_code_loc(expr.first().span().combine(&lhs_ast.span())),
+                            ctx.report_builder.span_to_code_loc(rhs_ast.span()),
                     ));
                 }
             }
@@ -1986,7 +2044,7 @@ macro_rules! gen_n_ary_operation {
                             ctx.report_builder,
                             i64::MIN,
                             i64::MAX,
-                            span.into(),
+                            ctx.report_builder.span_to_code_loc(span),
                         )
                     }
                 }
@@ -2096,13 +2154,13 @@ gen_binary_op!(
     Type::Integer,
     Type::Integer,
     Some(|ctx, _lhs, rhs, _lhs_span, rhs_span| {
-        if let TypeValue::Integer(Value::Const(value)) =
+        if let TypeValue::Integer { value: Const(value) } =
             ctx.ir.get(rhs).type_value()
         {
             if value < 0 {
                 return Err(UnexpectedNegativeNumber::build(
                     ctx.report_builder,
-                    rhs_span.into(),
+                    ctx.report_builder.span_to_code_loc(rhs_span),
                 ));
             }
         }
@@ -2116,13 +2174,13 @@ gen_binary_op!(
     Type::Integer,
     Type::Integer,
     Some(|ctx, _lhs, rhs, _lhs_span, rhs_span| {
-        if let TypeValue::Integer(Value::Const(value)) =
+        if let TypeValue::Integer { value: Const(value) } =
             ctx.ir.get(rhs).type_value()
         {
             if value < 0 {
                 return Err(UnexpectedNegativeNumber::build(
                     ctx.report_builder,
-                    rhs_span.into(),
+                    ctx.report_builder.span_to_code_loc(rhs_span),
                 ));
             }
         }
@@ -2164,7 +2222,84 @@ gen_binary_op!(
     // Integers can be compared with floats, but strings can be
     // compared only with another string.
     Type::Integer | Type::Float,
-    None
+    Some(|ctx, lhs, rhs, lhs_span, rhs_span| {
+        let lhs = ctx.ir.get(lhs).type_value();
+        let rhs = ctx.ir.get(rhs).type_value();
+
+        let (
+            const_string,
+            const_string_span,
+            constraints,
+            constrained_string_span,
+        ) = match (lhs, rhs, lhs_span, rhs_span) {
+            (
+                TypeValue::String { value: Const(const_string), .. },
+                TypeValue::String { constraints: Some(constraints), .. },
+                const_string_span,
+                constrained_string_span,
+            )
+            | (
+                TypeValue::String { constraints: Some(constraints), .. },
+                TypeValue::String { value: Const(const_string), .. },
+                constrained_string_span,
+                const_string_span,
+            ) => (
+                const_string,
+                const_string_span,
+                constraints,
+                constrained_string_span,
+            ),
+            _ => return Ok(()),
+        };
+
+        for constraint in constraints {
+            match constraint {
+                StringConstraint::Lowercase
+                    if const_string.chars().any(|c| c.is_uppercase()) =>
+                {
+                    ctx.warnings.add(|| {
+                        UnsatisfiableExpression::build(
+                            ctx.report_builder,
+                            "this is a lowercase string".to_string(),
+                            "this contains uppercase characters".to_string(),
+                            ctx.report_builder.span_to_code_loc(
+                                constrained_string_span.clone()
+                            ),
+                            ctx.report_builder.span_to_code_loc(
+                                const_string_span.clone()
+                            ),
+                            Some(
+                                "a lowercase string can't be equal to a string containing uppercase characters"
+                                .to_string())
+                        )
+                    });
+                }
+                StringConstraint::ExactLength(n)
+                    if const_string.len() != n =>
+                {
+                    ctx.warnings.add(|| {
+                        UnsatisfiableExpression::build(
+                            ctx.report_builder,
+                            format!("the length of this string is {}", n),
+                            format!(
+                                "the length of this string is {}",
+                                const_string.len()
+                            ),
+                            ctx.report_builder.span_to_code_loc(
+                                constrained_string_span.clone(),
+                            ),
+                            ctx.report_builder
+                                .span_to_code_loc(const_string_span.clone()),
+                            None,
+                        )
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        Ok(())
+    })
 );
 
 gen_binary_op!(

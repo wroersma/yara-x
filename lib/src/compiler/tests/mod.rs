@@ -19,7 +19,7 @@ fn serialization() {
 
     assert!(matches!(
         Rules::deserialize(b"YARA-X").err().unwrap(),
-        SerializationError::InvalidEncoding(_)
+        SerializationError::DecodeError(_)
     ));
 
     let rules = compile(r#"rule test { strings: $a = "foo" condition: $a }"#)
@@ -1084,6 +1084,44 @@ fn errors_serialization() {
     });
 
     assert_eq!(json_error, expected.to_string());
+}
+
+#[test]
+fn test_includes() {
+    let mut compiler = Compiler::new();
+
+    compiler
+        // this directory contains the included.yar file
+        .add_include_dir("src/compiler/tests/testdata/includes")
+        .add_source(r#"include "included_ok.yar""#)
+        .unwrap();
+
+    let rules = compiler.build();
+    let mut scanner = Scanner::new(&rules);
+
+    assert_eq!(scanner.scan(b"").unwrap().matching_rules().len(), 1);
+}
+
+#[test]
+fn test_disable_includes() {
+    let mut compiler = Compiler::new();
+
+    compiler
+        .enable_includes(false)
+        .add_include_dir("src/compiler/tests/testdata/includes");
+
+    assert_eq!(
+        compiler
+            .add_source(r#"include "included_ok.yar""#)
+            .unwrap_err()
+            .to_string(),
+        r#"error[E044]: include statements not allowed
+ --> line:1:1
+  |
+1 | include "included_ok.yar"
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^ includes are disabled for this compilation
+  |"#
+    );
 }
 
 #[test]

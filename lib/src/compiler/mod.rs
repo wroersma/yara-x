@@ -8,13 +8,12 @@ use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::HashSet;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 #[cfg(feature = "logging")]
 use std::time::Instant;
-use std::{fmt, iter};
+use std::{fmt, fs, iter, vec};
 
-use bincode::Options;
 use bitflags::bitflags;
 use bstr::{BStr, ByteSlice};
 use itertools::{izip, Itertools, MinMaxResult};
@@ -27,7 +26,7 @@ use thiserror::Error;
 use walrus::FunctionId;
 
 use yara_x_parser::ast;
-use yara_x_parser::ast::{Ident, Import, RuleFlags, WithSpan};
+use yara_x_parser::ast::{Ident, Import, Include, RuleFlags, WithSpan};
 use yara_x_parser::{Parser, Span};
 
 use crate::compiler::base64::base64_patterns;
@@ -37,7 +36,7 @@ use crate::compiler::errors::{
     DuplicateTag, EmitWasmError, InvalidRegexp, InvalidUTF8, UnknownModule,
     UnusedPattern,
 };
-use crate::compiler::report::{CodeLoc, ReportBuilder};
+use crate::compiler::report::ReportBuilder;
 use crate::compiler::{CompileContext, VarStack};
 use crate::modules::BUILTIN_MODULES;
 use crate::re;
@@ -58,6 +57,7 @@ pub use crate::compiler::rules::*;
 
 #[doc(inline)]
 pub use crate::compiler::warnings::*;
+use crate::errors::{IncludeError, IncludeNotAllowed, IncludeNotFound};
 use crate::linters::LinterResult;
 use crate::models::PatternKind;
 
@@ -239,14 +239,14 @@ pub struct Compiler<'a> {
     /// escape sequences.
     relaxed_re_syntax: bool,
 
-    /// If true, the compiler applies common subexpression elimination to
-    /// rule conditions.
-    cse: bool,
-
     /// If true, the compiler hoists loop-invariant expressions (i.e: those
     /// that don't vary on each iteration of the loop), moving them outside
     /// the loop.
     hoisting: bool,
+
+    /// List of directories where the compiler should look for included files.
+    /// If `None`, the current directory is used.
+    include_dirs: Option<Vec<PathBuf>>,
 
     /// If true, slow patterns produce an error instead of a warning. A slow
     /// pattern is one with atoms shorter than 2 bytes.
@@ -256,6 +256,10 @@ pub struct Compiler<'a> {
     /// rule is one where the upper bound of the loop is potentially large.
     /// Like for example: `for all x in (0..filesize) : (...)`
     error_on_slow_loop: bool,
+
+    /// If true, include statements are allowed. If false, include statements
+    /// will produce a compile error.
+    includes_enabled: bool,
 
     /// Used for generating error and warning reports.
     report_builder: ReportBuilder,
@@ -398,6 +402,38 @@ pub struct Compiler<'a> {
 }
 
 impl<'a> Compiler<'a> {
+    /// Adds a directory to the list of directories where the compiler should
+    /// look for included files.
+    ///
+    /// When an `include` statement is found, the compiler looks for the included
+    /// file in the directories added with this function, in the order they were
+    /// added.
+    ///
+    /// If this function is not called, the compiler will only look for included
+    /// files in the current directory.
+    ///
+    /// Use [Compiler::enable_includes] for controlling whether include statements
+    /// are allowed or not.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use yara_x::Compiler;
+    /// # use std::path::Path;
+    /// let mut compiler = Compiler::new();
+    /// compiler.add_include_dir("/path/to/rules")
+    ///         .add_include_dir("/another/path");
+    /// ```
+    pub fn add_include_dir<P: AsRef<std::path::Path>>(
+        &mut self,
+        dir: P,
+    ) -> &mut Self {
+        self.include_dirs
+            .get_or_insert_default()
+            .push(dir.as_ref().to_path_buf());
+        self
+    }
+
     /// Creates a new YARA compiler.
     pub fn new() -> Self {
         let mut ident_pool = StringPool::new();
@@ -457,7 +493,6 @@ impl<'a> Compiler<'a> {
             wasm_symbols,
             wasm_exports,
             relaxed_re_syntax: false,
-            cse: false,
             hoisting: false,
             error_on_slow_pattern: false,
             error_on_slow_loop: false,
@@ -483,6 +518,8 @@ impl<'a> Compiler<'a> {
             patterns: FxHashMap::default(),
             ir_writer: None,
             linters: Vec::new(),
+            include_dirs: None,
+            includes_enabled: true,
         }
     }
 
@@ -503,6 +540,7 @@ impl<'a> Compiler<'a> {
     /// continue calling this function for adding more rules. In such cases, any
     /// rules that failed to compile will not be included in the final compiled
     /// set.
+    /// about the source code's origin.
     pub fn add_source<'src, S>(
         &mut self,
         src: S,
@@ -541,7 +579,9 @@ impl<'a> Compiler<'a> {
                 };
                 return Err(InvalidUTF8::build(
                     &self.report_builder,
-                    Span(span_start as u32..span_end as u32).into(),
+                    self.report_builder.span_to_code_loc(Span(
+                        span_start as u32..span_end as u32,
+                    )),
                 ));
             }
         };
@@ -550,40 +590,7 @@ impl<'a> Compiler<'a> {
         // know if more errors were added.
         let existing_errors = self.errors.len();
 
-        let mut already_imported = FxHashMap::default();
-
-        // Process import statements. Checks that all imported modules
-        // actually exist, and raise warnings in case of duplicated
-        // imports within the same source file. For each module add a
-        // symbol to the current namespace.
-        for import in &ast.imports {
-            if let Some(span) =
-                already_imported.insert(&import.module_name, import.span())
-            {
-                self.warnings.add(|| {
-                    warnings::DuplicateImport::build(
-                        &self.report_builder,
-                        import.module_name.to_string(),
-                        import.span().into(),
-                        span.into(),
-                    )
-                })
-            }
-            // Import the module. This updates `self.root_struct` if
-            // necessary.
-            if let Err(err) = self.c_import(import) {
-                self.errors.push(err);
-            }
-        }
-
-        // Iterate over the list of declared rules and verify that their
-        // conditions are semantically valid. For each rule add a symbol
-        // to the current namespace.
-        for rule in ast.rules() {
-            if let Err(err) = self.c_rule(rule) {
-                self.errors.push(err);
-            }
-        }
+        self.c_items(ast.items());
 
         self.errors.extend(
             ast.into_errors()
@@ -740,9 +747,11 @@ impl<'a> Compiler<'a> {
         // An alternative is changing the `Rc` in some variants of `TypeValue`
         // to `Arc`, as the root cause that prevents `Struct` from being `Send`
         // is the use of `Rc` in `TypeValue`.
-        let serialized_globals = bincode::DefaultOptions::new()
-            .serialize(&self.root_struct)
-            .expect("failed to serialize global variables");
+        let serialized_globals = bincode::serde::encode_to_vec(
+            &self.root_struct,
+            bincode::config::standard().with_variable_int_encoding(),
+        )
+        .expect("failed to serialize global variables");
 
         let mut rules = Rules {
             serialized_globals,
@@ -838,10 +847,10 @@ impl<'a> Compiler<'a> {
 
     /// Tell the compiler that a YARA module is not supported.
     ///
-    /// Import statements for ignored modules will be ignored without
-    /// errors, but a warning will be issued. Any rule that make use of an
-    /// ignored module will be ignored, while the rest of rules that
-    /// don't rely on that module will be correctly compiled.
+    /// Import statements for ignored modules will be ignored without errors,
+    /// but a warning will be issued. Any rule that makes use of an ignored
+    /// module will be also ignored, while the rest of the rules that don't
+    /// rely on that module will be correctly compiled.
     pub fn ignore_module<M: Into<String>>(&mut self, module: M) -> &mut Self {
         self.ignored_modules.insert(module.into());
         self
@@ -949,6 +958,24 @@ impl<'a> Compiler<'a> {
         self
     }
 
+    /// Controls whether `include` statements are allowed.
+    ///
+    /// By default, the compiler allows the use of `include` statements, which
+    /// include the content of other files. When includes are disabled, any
+    /// attempt to use an `include` statement will result in a compile error.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use yara_x::Compiler;
+    /// let mut compiler = Compiler::new();
+    /// compiler.enable_includes(false);  // Disable includes
+    /// ```
+    pub fn enable_includes(&mut self, yes: bool) -> &mut Self {
+        self.includes_enabled = yes;
+        self
+    }
+
     /// When enabled, the compiler tries to optimize rule conditions.
     ///
     /// The optimizations usually reduce condition evaluation times, specially
@@ -959,13 +986,7 @@ impl<'a> Compiler<'a> {
     /// This is a very experimental feature.
     #[doc(hidden)]
     pub fn condition_optimization(&mut self, yes: bool) -> &mut Self {
-        // CSE is explicitly disabled for now.
-        self.cse(false).hoisting(yes)
-    }
-
-    pub(crate) fn cse(&mut self, yes: bool) -> &mut Self {
-        self.cse = yes;
-        self
+        self.hoisting(yes)
     }
 
     pub(crate) fn hoisting(&mut self, yes: bool) -> &mut Self {
@@ -1044,7 +1065,7 @@ impl Compiler<'_> {
                 Symbol::Rule(rule_id) => Err(DuplicateRule::build(
                     &self.report_builder,
                     ident.name.to_string(),
-                    ident.span().into(),
+                    self.report_builder.span_to_code_loc(ident.span()),
                     self.rules
                         .get(rule_id.0 as usize)
                         .unwrap()
@@ -1056,7 +1077,7 @@ impl Compiler<'_> {
                 _ => Err(ConflictingRuleIdentifier::build(
                     &self.report_builder,
                     ident.name.to_string(),
-                    ident.span().into(),
+                    self.report_builder.span_to_code_loc(ident.span()),
                 )),
             };
         }
@@ -1074,7 +1095,7 @@ impl Compiler<'_> {
                 return Err(DuplicateTag::build(
                     &self.report_builder,
                     tag.name.to_string(),
-                    tag.span().into(),
+                    self.report_builder.span_to_code_loc(tag.span()),
                 ));
             }
         }
@@ -1168,9 +1189,119 @@ impl Compiler<'_> {
 
         true
     }
+
+    fn read_included_file(
+        &mut self,
+        include: &Include,
+    ) -> Result<Vec<u8>, CompileError> {
+        // If no include directories are specified, use the current directory.
+        let current_dir = vec![PathBuf::from(".")];
+        let include_dirs = self.include_dirs.as_ref().unwrap_or(&current_dir);
+
+        // Try to read the file from each directory.
+        for dir in include_dirs {
+            let file_path = dir.join(include.file_name);
+            if file_path.exists() {
+                return fs::read(file_path).map_err(|err| {
+                    IncludeError::build(
+                        &self.report_builder,
+                        self.report_builder.span_to_code_loc(include.span()),
+                        err.to_string(),
+                    )
+                });
+            }
+        }
+
+        // If file not found anywhere, return an error.
+        Err(IncludeNotFound::build(
+            &self.report_builder,
+            include.file_name.to_string(),
+            self.report_builder.span_to_code_loc(include.span()),
+        ))
+    }
 }
 
 impl Compiler<'_> {
+    fn c_items<'a, I>(&mut self, items: I)
+    where
+        I: Iterator<Item = &'a ast::Item<'a>>,
+    {
+        let mut already_imported = FxHashMap::default();
+
+        for item in items {
+            match item {
+                ast::Item::Import(import) => {
+                    // Checks that all imported modules actually exist, and
+                    // raise warnings in case of duplicated imports within
+                    // the same source file. For each module add a symbol to
+                    // the current namespace.
+                    if let Some(span) = already_imported
+                        .insert(&import.module_name, import.span())
+                    {
+                        self.warnings.add(|| {
+                            warnings::DuplicateImport::build(
+                                &self.report_builder,
+                                import.module_name.to_string(),
+                                self.report_builder
+                                    .span_to_code_loc(import.span()),
+                                self.report_builder.span_to_code_loc(span),
+                            )
+                        })
+                    }
+                    // Import the module. This updates `self.root_struct` if
+                    // necessary.
+                    if let Err(err) = self.c_import(import) {
+                        self.errors.push(err);
+                    }
+                }
+                ast::Item::Include(include) => {
+                    // Return an error if includes are disabled
+                    if !self.includes_enabled {
+                        self.errors.push(IncludeNotAllowed::build(
+                            &self.report_builder,
+                            self.report_builder
+                                .span_to_code_loc(include.span()),
+                        ));
+                        continue;
+                    }
+
+                    let included = match self.read_included_file(include) {
+                        Ok(included) => included,
+                        Err(err) => {
+                            self.errors.push(err);
+                            continue;
+                        }
+                    };
+
+                    // Save the current source ID from the report builder in
+                    // order to restore it later. Any recursive call to
+                    // `add_source` will change the current source ID, and we
+                    // need to restore after `add_source` returns.
+                    let source_id =
+                        self.report_builder.get_current_source_id().unwrap();
+
+                    // Any error generated while processing the included source
+                    // code will be added to `self.errors`. The error returned
+                    // by `add_source` is simply the first of the added errors,
+                    // we don't need to handle the error here.
+                    let _ = self.add_source(
+                        SourceCode::from(included.as_slice())
+                            .with_origin(include.file_name),
+                    );
+
+                    // Restore the current source ID to the value it had before
+                    // calling `add_source`.
+                    self.report_builder.set_current_source_id(source_id);
+                }
+                ast::Item::Rule(rule) => {
+                    if let Err(err) = self.c_rule(rule) {
+                        self.errors.push(err);
+                    }
+                }
+            }
+        }
+    }
+
     fn c_rule(&mut self, rule: &ast::Rule) -> Result<(), CompileError> {
         // Check if another rule, module or variable has the same identifier
         // and return an error in that case.
@@ -1257,10 +1388,9 @@ impl Compiler<'_> {
             namespace_id: self.current_namespace.id,
             namespace_ident_id: self.current_namespace.ident_id,
             ident_id: self.ident_pool.get_or_intern(rule.identifier.name),
-            ident_ref: CodeLoc::new(
-                self.report_builder.current_source_id(),
-                rule.identifier.span(),
-            ),
+            ident_ref: self
+                .report_builder
+                .span_to_code_loc(rule.identifier.span()),
             tags,
             patterns: vec![],
             is_global: rule.flags.contains(RuleFlags::Global),
@@ -1282,6 +1412,7 @@ impl Compiler<'_> {
             vars: VarStack::new(),
             for_of_depth: 0,
             features: &self.features,
+            loop_iteration_multiplier: 1,
         };
 
         // Convert the patterns from AST to IR. This populates the
@@ -1337,7 +1468,8 @@ impl Compiler<'_> {
                         self.warnings.add(|| {
                             warnings::SlowPattern::build(
                                 &self.report_builder,
-                                pat.span().into(),
+                                self.report_builder
+                                    .span_to_code_loc(pat.span().clone()),
                             )
                         });
                     }
@@ -1398,10 +1530,6 @@ impl Compiler<'_> {
             }
         };
 
-        if self.cse {
-            condition = self.ir.cse();
-        }
-
         if self.hoisting {
             condition = self.ir.hoisting();
         }
@@ -1438,7 +1566,8 @@ impl Compiler<'_> {
                 return Err(UnusedPattern::build(
                     &self.report_builder,
                     pattern.identifier().name.to_string(),
-                    pattern.identifier().span().into(),
+                    self.report_builder
+                        .span_to_code_loc(pattern.identifier().span()),
                 ));
             }
 
@@ -1547,7 +1676,7 @@ impl Compiler<'_> {
                     warnings::IgnoredModule::build(
                         &self.report_builder,
                         module_name.to_string(),
-                        import.span().into(),
+                        self.report_builder.span_to_code_loc(import.span()),
                         None,
                     )
                 });
@@ -1558,7 +1687,7 @@ impl Compiler<'_> {
                 Err(UnknownModule::build(
                     &self.report_builder,
                     module_name.to_string(),
-                    import.span().into(),
+                    self.report_builder.span_to_code_loc(import.span()),
                 ))
             };
         }
@@ -1637,7 +1766,7 @@ impl Compiler<'_> {
                 &self.report_builder,
                 error_title.clone(),
                 error_msg.clone(),
-                import.span().into(),
+                self.report_builder.span_to_code_loc(import.span()),
             ));
         }
 
@@ -2166,7 +2295,7 @@ impl Compiler<'_> {
             re::Error::TooLarge => InvalidRegexp::build(
                 &self.report_builder,
                 "regexp is too large".to_string(),
-                (&span).into(),
+                self.report_builder.span_to_code_loc(span.clone()),
                 None,
             ),
             _ => unreachable!(),
@@ -2176,7 +2305,7 @@ impl Compiler<'_> {
             return Err(InvalidRegexp::build(
                 &self.report_builder,
                 "this regexp can match empty strings".to_string(),
-                (&span).into(),
+                self.report_builder.span_to_code_loc(span),
                 None,
             ));
         }
@@ -2204,13 +2333,13 @@ impl Compiler<'_> {
             if self.error_on_slow_pattern {
                 return Err(errors::SlowPattern::build(
                     &self.report_builder,
-                    span.into(),
+                    self.report_builder.span_to_code_loc(span),
                 ));
             } else {
                 self.warnings.add(|| {
                     warnings::SlowPattern::build(
                         &self.report_builder,
-                        span.into(),
+                        self.report_builder.span_to_code_loc(span),
                     )
                 });
             }
@@ -2662,7 +2791,7 @@ impl Warnings {
 
     /// Returns true if the given code is a valid warning code.
     pub fn is_valid_code(code: &str) -> bool {
-        Warning::all_codes().iter().any(|c| *c == code)
+        Warning::all_codes().contains(&code)
     }
 
     /// Enables or disables a specific warning identified by `code`.

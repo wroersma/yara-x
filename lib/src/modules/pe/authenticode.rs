@@ -1,17 +1,19 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt::Write;
 
 use array_bytes::Hexify;
+use bstr::ByteSlice;
 use const_oid::db::{rfc5911, rfc5912, rfc6268};
 use const_oid::{AssociatedOid, ObjectIdentifier};
 use der_parser::asn1_rs::{Set, Tag, ToDer, UtcTime};
 use digest::{Digest, Output};
+use rsa::pkcs8::AssociatedOid as RsaAssociatedOid;
 use dsa::Components;
 use ecdsa::signature::hazmat::PrehashVerifier;
 use itertools::Itertools;
 use md2::Md2;
 use md5::Md5;
-use nom::AsBytes;
 use protobuf::MessageField;
 use rsa::traits::SignatureScheme;
 use rsa::Pkcs1v15Sign;
@@ -32,6 +34,34 @@ use crate::modules::utils::asn1::{
     ContentInfo, DigestInfo, SignedData, SignerInfo, SpcIndirectDataContent,
     SpcSpOpusInfo, TstInfo,
 };
+
+// Wrapper to adapt digest 0.11 hashers to std::io::Write
+struct DigestWriter<D: Digest> {
+    hasher: D,
+}
+
+impl<D: Digest> DigestWriter<D> {
+    fn new(hasher: D) -> Self {
+        Self { hasher }
+    }
+    
+    fn finalize(self) -> Output<D> {
+        self.hasher.finalize()
+    }
+}
+
+impl<D: Digest> std::io::Write for DigestWriter<D> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        Ok(buf.len())
+    }
+    
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// MD2 should now work directly with digest 0.11 from the GitHub version
 
 /// Error returned by [`AuthenticodeParser::parse`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -880,36 +910,36 @@ fn verify_signer_info(si: &SignerInfo, certs: &[Certificate<'_>]) -> bool {
     // Verify that the signature in `SignerInfo` is correct.
     match digest_algorithm {
         rfc5912::ID_MD_2 | rfc5912::MD_2_WITH_RSA_ENCRYPTION => {
-            let mut md2 = Md2::default();
-            attrs_set.write_der(&mut md2).unwrap();
-            key.verify_digest::<Md2>(md2.finalize(), si.signature)
+            let mut md2_writer = DigestWriter::new(Md2::default());
+            attrs_set.write_der(&mut md2_writer).unwrap();
+            key.verify_digest::<Md2>(md2_writer.finalize(), si.signature)
         }
         rfc5912::ID_MD_5 | rfc5912::MD_5_WITH_RSA_ENCRYPTION => {
-            let mut md5 = Md5::default();
-            attrs_set.write_der(&mut md5).unwrap();
-            key.verify_digest::<Md5>(md5.finalize(), si.signature)
+            let mut md5_writer = DigestWriter::new(Md5::default());
+            attrs_set.write_der(&mut md5_writer).unwrap();
+            key.verify_digest::<Md5>(md5_writer.finalize(), si.signature)
         }
         rfc5912::ID_SHA_1
         | rfc5912::SHA_1_WITH_RSA_ENCRYPTION
         | oid::SHA1_WITH_RSA_ENCRYPTION_OBSOLETE => {
-            let mut sha1 = Sha1::default();
-            attrs_set.write_der(&mut sha1).unwrap();
-            key.verify_digest::<Sha1>(sha1.finalize(), si.signature)
+            let mut sha1_writer = DigestWriter::new(Sha1::default());
+            attrs_set.write_der(&mut sha1_writer).unwrap();
+            key.verify_digest::<Sha1>(sha1_writer.finalize(), si.signature)
         }
         rfc5912::ID_SHA_256 | rfc5912::SHA_256_WITH_RSA_ENCRYPTION => {
-            let mut sha256 = Sha256::default();
-            attrs_set.write_der(&mut sha256).unwrap();
-            key.verify_digest::<Sha256>(sha256.finalize(), si.signature)
+            let mut sha256_writer = DigestWriter::new(Sha256::default());
+            attrs_set.write_der(&mut sha256_writer).unwrap();
+            key.verify_digest::<Sha256>(sha256_writer.finalize(), si.signature)
         }
         rfc5912::ID_SHA_384 | rfc5912::SHA_384_WITH_RSA_ENCRYPTION => {
-            let mut sha384 = Sha384::default();
-            attrs_set.write_der(&mut sha384).unwrap();
-            key.verify_digest::<Sha384>(sha384.finalize(), si.signature)
+            let mut sha384_writer = DigestWriter::new(Sha384::default());
+            attrs_set.write_der(&mut sha384_writer).unwrap();
+            key.verify_digest::<Sha384>(sha384_writer.finalize(), si.signature)
         }
         rfc5912::ID_SHA_512 | rfc5912::SHA_512_WITH_RSA_ENCRYPTION => {
-            let mut sha512 = Sha512::default();
-            attrs_set.write_der(&mut sha512).unwrap();
-            key.verify_digest::<Sha512>(sha512.finalize(), si.signature)
+            let mut sha512_writer = DigestWriter::new(Sha512::default());
+            attrs_set.write_der(&mut sha512_writer).unwrap();
+            key.verify_digest::<Sha512>(sha512_writer.finalize(), si.signature)
         }
         _ => {
             #[cfg(feature = "logging")]
@@ -928,7 +958,23 @@ fn verify_signer_info(si: &SignerInfo, certs: &[Certificate<'_>]) -> bool {
 /// contained in the PE file.
 struct CertificateChain<'a, 'b> {
     certs: &'b [Certificate<'a>],
+    /// Holds the next certificate that will be returned while iterating the
+    /// certificate chain.
     next: Option<&'b Certificate<'a>>,
+    /// Contains the certificates that have been returned while iterating the
+    /// certificate chain. This prevents infinite loops while iterating chains
+    /// that contains loops.
+    ///
+    /// Loops in the certificate chain are not common, but they are possible,
+    /// file 147f2a24913f67e66c0fe70e6804efdd1a804e17ab66e8abc5a2e1f64a708a80
+    /// contains a certificate with subject "AddTrust External CA Root" and
+    /// issuer "UTN - DATACorp SGC", but there's a certificate with subject
+    /// "UTN - DATACorp SGC" and issuer "AddTrust External CA Root". Curiously
+    /// enough, these same entities are mentioned in multiple bug reports:
+    ///
+    /// https://redmine.lighttpd.net/issues/2562
+    /// https://dev.gnupg.org/T2972
+    seen: HashSet<&'a [u8]>,
 }
 
 impl<'a, 'b> CertificateChain<'a, 'b> {
@@ -943,7 +989,7 @@ impl<'a, 'b> CertificateChain<'a, 'b> {
         P: Fn(&X509Certificate<'_>) -> bool,
     {
         let next = certs.iter().find(|cert| predicate(&cert.x509));
-        Self { certs, next }
+        Self { certs, next, seen: HashSet::new() }
     }
 
     /// Returns `true` if the certificate chain is valid.
@@ -1009,17 +1055,27 @@ impl<'a, 'b> Iterator for CertificateChain<'a, 'b> {
     fn next(&mut self) -> Option<Self::Item> {
         let next = self.next;
         if let Some(next) = self.next {
-            // When the certificate is self-signed issuer == subject, in that
+            // If issuer == subject, the certificate is self-signed. In that
             // case we can't keep going up the chain.
             if next.x509.tbs_certificate.subject
                 == next.x509.tbs_certificate.issuer
             {
                 self.next = None
             } else {
-                self.next = self.certs.iter().find(|c| {
-                    c.x509.tbs_certificate.subject
-                        == next.x509.tbs_certificate.issuer
-                });
+                self.next = self
+                    .certs
+                    .iter()
+                    // The next certificate must be the issuer of the current one...
+                    .find(|c| {
+                        c.x509.tbs_certificate.subject
+                            == next.x509.tbs_certificate.issuer
+                    })
+                    // ... except if the issuer was already returned by the iterator,
+                    // which indicates that the certificate chain contains a loop.
+                    .filter(|c| {
+                        self.seen
+                            .insert(c.x509.tbs_certificate.subject.as_raw())
+                    });
             }
         }
         next
@@ -1043,13 +1099,10 @@ enum PublicKeyError {
     Pkcs8(#[from] rsa::pkcs8::spki::Error),
 
     #[error("DER parsing error")]
-    Der(#[from] der_parser::error::Error),
+    Der(#[from] der_parser::error::BerError),
 
     #[error("ECDSA error")]
     Ecdsa(#[from] ecdsa::Error),
-
-    #[error("DER parsing error")]
-    Nom(#[from] nom::Err<der_parser::error::Error>),
 
     #[error("Missing algorithm parameters")]
     MissingAlgorithmParameters,
@@ -1087,10 +1140,18 @@ impl TryFrom<&SubjectPublicKeyInfo<'_>> for PublicKey {
                 let key_bytes = spki.subject_public_key.as_ref();
 
                 use der_parser::ber::parse_ber_integer;
-                let (_, y) = parse_ber_integer(key_bytes)?;
-                let (rem, p) = parse_ber_integer(parameters.data)?;
-                let (rem, q) = parse_ber_integer(rem)?;
-                let (_, g) = parse_ber_integer(rem)?;
+
+                let (_, y) = parse_ber_integer(key_bytes)
+                    .map_err(|err| PublicKeyError::Der(err.into()))?;
+
+                let (rem, p) = parse_ber_integer(parameters.data)
+                    .map_err(|err| PublicKeyError::Der(err.into()))?;
+
+                let (rem, q) = parse_ber_integer(rem)
+                    .map_err(|err| PublicKeyError::Der(err.into()))?;
+
+                let (_, g) = parse_ber_integer(rem)
+                    .map_err(|err| PublicKeyError::Der(err.into()))?;
 
                 let p = dsa::BigUint::from_bytes_be(p.content.as_slice()?);
                 let q = dsa::BigUint::from_bytes_be(q.content.as_slice()?);
@@ -1185,7 +1246,7 @@ impl PublicKey {
     }
 
     #[cfg(not(feature = "x509-parser-verify"))]
-    fn verify_impl<D: Digest + AssociatedOid>(
+    fn verify_impl<D: Digest + AssociatedOid + RsaAssociatedOid>(
         &self,
         message: &[u8],
         signature: &[u8],
@@ -1194,7 +1255,7 @@ impl PublicKey {
         self.verify_digest::<D>(digest, signature)
     }
 
-    fn verify_digest<D: Digest + AssociatedOid>(
+    fn verify_digest<D: Digest + AssociatedOid + RsaAssociatedOid>(
         &self,
         hash: Output<D>,
         signature: &[u8],
